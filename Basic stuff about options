@@ -1,0 +1,35 @@
+from AlgorithmImports import *
+
+
+class OptionsBasics(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2020, 12, 13)
+        self.SetEndDate(2020, 12, 13)
+        self.SetCash(1e4)
+        self.aapl = self.AddEquity("AAPL", Resolution.Minute)
+        self.aapl_option = self.AddOption("AAPL", Resolution.Minute)
+        self.aapl_option.SetFilter(lambda x: x.IncludeWeeklys().Strikes(-3, 3).Expiration(timedelta(0), timedelta(40)))
+        self.first_time = True
+
+    def OnData(self, data: Slice):
+        if self.first_time:
+            if data.ContainsKey("AAPL"): 
+                for chain in data.OptionChains.Values:
+                    self.Log(f"Chain: {chain}")
+                    for contract in chain:
+                        name = contract.Symbol
+                        underlying = contract.UnderlyingSymbol
+                        expiration = contract.Expiry
+                        right = "Call" if contract.Right == 0 else "Put"
+                        strike = contract.Strike
+                        bid = contract.BidPrice
+                        ask = contract.AskPrice
+                    self.Log(f"Name: {name}, Underlying: {underlying}, Expiration: {expiration}")
+                    self.Log(f"Right: {right}, Strike: {strike}, Bid: {bid}, Ask: {ask}")
+                    self.Log("------------------------------------")
+                    break
+            self.first_time = False
+
+
+        
