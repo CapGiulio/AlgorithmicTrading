@@ -1,0 +1,166 @@
+# NOTE THAT THERE ARE REASONS WHY I AM NOT USING REAL MONEY ON THIS STRATEGY
+# I define a vertical volatility skew as a situation in which options with the same underlying and expiration have 
+significantly-different implied volatilities. Such scenarios represent opportunities because stock price changes have 
+historically been proven to follow a distribution that resembles a Lognormal one. When option on the same asset have 
+a high (vertical) volatility skew the market is essentially wrong, because it is assuming that the underlying has a 
+significantly-higher probability of moving in one direction over the other, whereas those probabilities are nearly the 
+same in the relatively-short run. Thus, I see vertical volatility skews as a way to profit from irrational implications 
+that traders make about the future direction of prices. 
+# The strategy looks for securities with significant vertical volatility skews and it opens a backspread. The backspread 
+serves the specific purpose of buying low-IV options and selling high-IV ones. Every position is delta-neutral, so that the 
+direction of prices is almost irrelevant. To determine whether a security has an attractive volatility skew, I group together 
+the options with the same class and expiration, compute the implied volatility of each one (using the Black-Scholes model), 
+and I calculate the standard deviation of these numbers. If this standard deviation is greater than 18% of the average implied 
+volatility, then the skewness is high enough to trade (the 18% number is not randomly-chosen, but it is the one that, in numerous 
+backtests, gave me the best risk/reward ratio). Obviously when the options expire the skewness disappears, and thus the position 
+profits if the difference in IVs between the long and short options was high enough. 
+
+from AlgorithmImports import *
+import math
+
+class VolatilitySkewness(QCAlgorithm):
+    def Initialize(self):
+        self.SetStartDate(2020, 1, 6)
+        self.SetEndDate(2020, 1, 23)
+        self.SetCash(1e6)
+        # for the sake of this demonstration I just worked with Tesla, 
+        # but obviously an accurate selection process would be required here
+        self.tsla = self.AddEquity("TSLA", Resolution.Minute)
+        self.tsla_option = self.AddOption(self.tsla.Symbol, Resolution.Minute)
+        self.n = 7
+        self.tsla_option.SetFilter(lambda x: x.IncludeWeeklys().Strikes(-self.n, self.n).Expiration(timedelta(1), timedelta(200)))       
+
+
+    def compute_volatility(self, symbol, n=30):  # no options required
+        prices = np.array(self.History(symbol, n+1, Resolution.Daily)["close"])
+        pct_changes_logs = np.log(prices[1:] / prices[:-1])
+        v_t = np.std(pct_changes_logs)
+        return v_t * (252**0.5)  # this is the standard deviation of the logarithms of the percentage changes of prices, annualized
+
+
+    def gaussian_cdf(self, x):
+        assert x != 0
+        y = 1 / (1+0.2316419*abs(x))
+        z = 0.3989423 * math.e ** (-1 * x**2/2)
+        out = 1 - z*(1.330274*y**5 - 1.821256*y**4 + 1.781478*y**3 - 0.356538*y**2 + 0.3193815*y)
+        if x > 0:
+            return out
+        return 1 - out
+
+
+    def black_scholes(self, option, input_volatility=False, v=None):
+        if not input_volatility:
+            v = self.compute_volatility(option.UnderlyingSymbol)
+        p = option.UnderlyingLastPrice
+        s = option.Strike
+        t = ((option.Expiry - self.Time).days + 1) / 365
+        r = 0.03
+        x = (math.log(p/s) + (r+v**2/2) * t) / (v*t**0.5)
+        y = x - v*t**0.5
+        return (p * self.gaussian_cdf(x)) - (s*math.e**(-1*r*t) * self.gaussian_cdf(y))
+    
+
+    def compute_iv(self, option):
+        p = self.black_scholes(option)
+        vol = 0.01
+        while self.black_scholes(option=option, input_volatility=True, v=vol) < p:   # an iterative process is required here    
+            vol += 0.01
+        return vol
+    
+
+    def check_and_trade(self, l):
+        ivs = dict([(self.compute_iv(contract), contract) for contract in l])
+        ivs_std = np.std(list(ivs.keys()))
+        if ivs_std > 0.18 * np.mean(list(ivs.keys())):   # after numerous backtests, I have found the 18% threshold to be the best one for skewness assessment      
+            max_iv_contract = ivs[max(ivs)]
+            min_iv_contract = ivs[min(ivs)]
+            # here I am assuming the 3:2 ratio to be a delta-neutral one (in reality, I should do some work to find
+            # a computationally-efficient way to compute a delta-neutral ratio, assuming I am using little capital)
+            q_long = 3
+            q_short = 2
+            premium_or_cost = q_short * max_iv_contract.BidPrice - q_long * min_iv_contract.AskPrice
+            margin_requirements = (abs(max_iv_contract.Strike - min_iv_contract.Strike) - premium_or_cost) * 100
+            if margin_requirements < self.Portfolio.Cash * 0.9:
+                self.LimitOrder(min_iv_contract.Symbol, q_long, min_iv_contract.AskPrice*0.98)
+                self.LimitOrder(max_iv_contract.Symbol, -1*q_short, max_iv_contract.BidPrice*1.02)
+    
+    def OnData(self, data):
+        if data.ContainsKey(self.tsla.Symbol) and self.Time.minute==40:  # this runs once every hour
+            for chain in data.OptionChains.Values:
+                calls = [x for x in chain if x.Right==0]  # list of options objects
+                puts = [x for x in chain if x.Right==1]  # idem
+                # the distinction between puts and calls is carried out until the end of the algorithm because,
+                # in case I find that, for example, the calls present an opportunity much more frequently than
+                # the puts, I can just focus on calls and save a lot of computational time (vice versa for the puts)
+
+                expirations_calls = [x.Expiry for x in calls]
+                expirations_puts = [x.Expiry for x in puts]
+                expirations_dict_calls = {}
+                expirations_dict_puts = {}
+                for x in expirations_calls:
+                    if x not in expirations_dict_calls:
+                        expirations_dict_calls[x] = []
+                for x in expirations_puts:
+                    if x not in expirations_dict_puts:
+                        expirations_dict_puts[x] = []
+
+                for x in calls:                                  # the keys are datetime.datetime objects, while the values are             
+                    expirations_dict_calls[x.Expiry].append(x)   # lists of options objects (obviously with the same expiration)      
+                for x in puts:
+                    expirations_dict_puts[x.Expiry].append(x)
+
+                expirations_dict_calls = {x:sorted(y, key=lambda z:z.Strike) for (x,y) in expirations_dict_calls.items()}    
+                expirations_dict_puts = {x:sorted(y, key=lambda z:z.Strike) for (x,y) in expirations_dict_puts.items()}
+
+                for x in expirations_dict_calls:
+                    lista = expirations_dict_calls[x]
+                    the_half = None
+                    for i in range(len(lista)):
+                        if lista[i].Strike > calls[0].UnderlyingLastPrice:
+                            the_half = i
+                            break
+                    if the_half == None:
+                        expirations_dict_calls[x] = None
+                    else:
+                        sopra = lista[the_half:the_half + self.n]
+                        sotto = lista[the_half - self.n:the_half]
+                        expirations_dict_calls[x] = sotto + sopra  
+                for x in expirations_dict_puts:
+                    lista = expirations_dict_puts[x]
+                    the_half = None
+                    for i in range(len(lista)):
+                        if lista[i].Strike > puts[0].UnderlyingLastPrice:
+                            the_half = i
+                            break
+                    if the_half == None:
+                        expirations_dict_puts[x] = None
+                    else:
+                        sopra = lista[the_half:the_half + self.n]
+                        sotto = lista[the_half - self.n:the_half]
+                        expirations_dict_puts[x] = sotto + sopra  
+
+                for subchain in list(expirations_dict_calls.values()):  # len(subchain) == 2 * self.n, almost all the times     
+                    if subchain != None:
+                        self.check_and_trade(subchain)
+                for subchain in list(expirations_dict_puts.values()):
+                    if subchain != None:
+                        self.check_and_trade(subchain)
+            
+
+    def OnMarginCallWarning(self):  # this runs when it's very probable to shortly get a margin call
+        
+        self.Log("Warning: A margin call could come soon")
+        
+    def OnMarginCall(self, requests):  # this function runs every time I receive a margin call
+        for order in requests:  # requests is a list of Order objects (it almost always contains just one order)
+            requests.remove(order)
+            new_order = SubmitOrderRequest(order.OrderType, order.SecurityType, 
+                       order.Symbol, int(order.Quantity * 1.1), order.StopPrice,
+                       order.LimitPrice, self.Time, "OnMarginCall")  # whenever I receive a margin call, I modify the order to increase by 10% the quantity to be liquidated      
+            requests.append(new_order)
+        return requests  
+        
+        
+        
+        
+    
