@@ -1,0 +1,70 @@
+# NOTE THAT THERE ARE REASONS WHY I DON'T USE THIS ALGORITHM WITH REAL MONEY
+# The algorithm basically looks for options whose fair value (i.e., the value of the shares they control) is larger than their cost, then it buys those 
+# options (provided that I have enough cash to immediately exercise them), indeed exercises them, and immediately closes the stock trade 
+
+from AlgorithmImports import *
+
+class OptionArbitrage(QCAlgorithm):
+    def Initialize(self):
+        self.SetStartDate(2022, 1, 1)  
+        self.SetEndDate(2022, 4, 1)
+        self.SetCash(1e6)
+
+        self.aapl = self.AddEquity("AAPL", Resolution.Minute)
+        self.aapl_option = self.AddOption("AAPL")
+        self.aapl_option.SetFilter(lambda x: x.IncludeWeeklys().Strikes(-10, 10).Expiration(timedelta(0), timedelta(100))) #only ITM options
+        self.wanna_trade = True 
+        self.open_order = None
+
+
+    def OnData(self, data):
+        if self.wanna_trade and data.ContainsKey(self.aapl.Symbol): # and data[self.aapl.Symbol]:
+            for chain in data.OptionChains.Values:
+                underlying_price = list(chain)[0].UnderlyingLastPrice
+
+                itm_calls = np.array([contract for contract in chain if contract.Right==0 and contract.Strike<underlying_price and data.ContainsKey(contract.Symbol)])    
+                beps = np.array([x.Strike + x.AskPrice for x in itm_calls])  # this row contains the break-even prices of each option   
+                check = underlying_price - 1.01*beps  # if this is positive, there is an arbitrage opportunity, because the option is trading for less than its intrinsic value      
+                contracts_to_trade = itm_calls[check > 0]  # if this contains at least one element, we have an arbitrage opportunity          
+                for contract in contracts_to_trade:  # clearly this will always contain either 0 or very few options, so I can safely afford a for loop
+                    self.quantity = (self.Portfolio.MarginRemaining*0.9) // (underlying_price * 100)
+                    if self.quantity > 0: # I go forward only if I can afford to exercise the options
+                        self.open_order = self.LimitOrder(contract.Symbol, self.quantity, round(contract.AskPrice, 2))
+                        self.option = contract
+                        self.underlying_price = underlying_price
+                        self.wanna_trade = False
+                        self.Log(f"Just bought {self.quantity} contracts of {contract.Symbol}")
+                        ### Find a way to make sure this order cancels out if not filled within two minutes ###
+                        return  # this is done in order to give the algorithm the time to exercise the options
+                
+                itm_puts = np.array([contract for contract in chain if contract.Right==1 and contract.Strike>underlying_price and data.ContainsKey(contract.Symbol)])
+                beps = np.array([x.Strike - x.AskPrice for x in itm_puts])  # this row contains the break-even prices of each option   
+                check = 0.99*beps - underlying_price  # if this is positive, there is an arbitrage opportunity, because the option is trading for less than its intrinsic value    
+                contracts_to_trade = itm_puts[check > 0]  # if this contains at least one element, we have an arbitrage opportunity          
+                for contract in contracts_to_trade:  # clearly this will always contain either 0 or very few options, so I can safely afford a for loop
+                    self.quantity = (self.Portfolio.Cash*0.9) // (underlying_price * 100)
+                    if self.quantity > 0: # I go forward only if I can afford to exercise the options
+                        self.open_order = self.LimitOrder(contract.Symbol, self.quantity, round(contract.AskPrice, 2))
+                        self.option = contract
+                        self.underlying_price = underlying_price
+                        self.wanna_trade = False
+                        self.Log(f"Just bought {self.quantity} contracts of {contract.Symbol}")
+                        ### Find a way to make sure this order cancels out if not filled within two minutes ###
+                        return  # this is done in order to give the algorithm the time to exercise the options
+
+
+    def OnOrderEvent(self, orderEvent):   # this gets triggered as soon as an order is created
+        if str(orderEvent.Status) == "OrderStatus.Filled" and orderEvent.OrderId == self.open_order.OrderId:
+            self.ExerciseOption(self.option.Symbol, self.quantity)
+            
+            if self.option.Right == 0:
+                self.close_order = self.LimitOrder(self.option.UnderlyingSymbol, -self.quantity*100, round(self.underlying_price, 2))       
+            elif self.option.Right == 1:                                                                                                      
+                self.close_order = self.LimitOrder(self.option.UnderlyingSymbol, self.quantity*100, round(self.underlying_price, 2))        
+            
+            self.Log(f"Take profit submitted for {self.option.Symbol}")
+            self.Log("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -")
+            self.wanna_trade = True
+            self.underlying_price, self.quantity, self.option = None, None, None
+            
+            
